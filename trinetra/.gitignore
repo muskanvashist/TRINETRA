@@ -1,0 +1,15 @@
+# Environment variables (contains real API keys)
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Data and generated outputs (regenerable, don't need to be in Git)
+data/raw/
+data/processed/
+data/labels/
+models/*.pkl
+
+# Streamlit temp files
+temp_fundflow.html

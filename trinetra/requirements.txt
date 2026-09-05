@@ -1,0 +1,21 @@
+# Trinetra - Python dependencies
+# Install with: pip install -r requirements.txt --break-system-packages
+
+# --- Core data handling ---
+pandas
+numpy
+
+# --- Blockchain API calls ---
+requests
+python-dotenv
+
+# --- Machine learning ---
+scikit-learn
+joblib
+
+# --- Report / PDF generation ---
+reportlab
+
+# --- Dashboard ---
+streamlit
+plotly
