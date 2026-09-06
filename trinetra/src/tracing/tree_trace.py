@@ -19,6 +19,10 @@ MIN_VALUE_SHARE_TO_FOLLOW = 0.05   # ignore branches carrying <5% of parent valu
 MAX_BRANCHES_PER_HOP = 8            # compute/API budget guardrail
 MAX_TOTAL_NODES = 500               # overall trace budget for the whole tree
 MAX_DEPTH = 5
+MIN_INDEGREE_FOR_TERMINUS = 3   # a real exchange deposit address receives from MANY senders --
+                                  # requiring this prevents a simple pass-through mule wallet
+                                  # (1 in, 1 out, matching amount/time by coincidence) from being
+                                  # misclassified as an exchange and cutting the trace short too early
 
 
 class HopNode:
@@ -32,6 +36,9 @@ class HopNode:
         self.value_share = None              # what % of parent's value flowed into this branch
         self.priority_score = None           # combined money+network investigation priority (0-1)
         self.priority_level = None           # 'HIGH' | 'MEDIUM' | 'LOW'
+        self.pattern_label = None            # 'SUSPECTED_MIXER' | 'FAN_OUT_LAYERING' | 'PEEL_CHAIN' | 'SMURFING' | 'NORMAL_MULE' -- this node's OWN forwarding behavior
+        self.forced_role = None              # overrides the computed role -- used when we KNOW a node is the true Victim sender (from a transaction-ID entry point)
+        self.percent_of_original = None      # what % of the ORIGINAL traced amount this hop still carries (not just % of its immediate parent)
 
 
 def fetch_transfers(address, limit=200):
@@ -44,7 +51,12 @@ def fetch_transfers(address, limit=200):
         resp = requests.get(url, headers=headers, params=params, timeout=10)
         resp.raise_for_status()
         raw = resp.json().get('data', [])
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        # IMPORTANT: previously this silently returned [] on ANY failure
+        # (rate limit, network error, bad address) -- making a rate-limit
+        # hit indistinguishable from a genuine "no transactions" dead end.
+        # Now the real reason is printed so it's visible during a trace.
+        print(f"[fetch_transfers] Failed for {address}: {e}")
         return []
 
     edges = []
@@ -67,6 +79,11 @@ def decide_branches(parent_node, outgoing_edges, total_incoming_value, budget_st
     each tagged with status + reason -- followed AND not-followed both logged --
     PLUS a priority score (money-flow + network-behavior) so the caller
     knows which branch to explore first, best-first-search style.
+
+    IMPORTANT: if the PARENT itself is exhibiting fan-out or smurfing
+    behavior, individual branches carrying a small value share are NOT
+    pruned -- a small share per branch is the defining evidence of these
+    patterns, so pruning them would hide the exact addresses that matter.
     """
     decisions = []
     sorted_edges = sorted(outgoing_edges, key=lambda e: e['amount'], reverse=True)
@@ -74,14 +91,15 @@ def decide_branches(parent_node, outgoing_edges, total_incoming_value, budget_st
     original_stolen_amount = original_stolen_amount or total_incoming_value
     cumulative_path_amount = cumulative_path_amount if cumulative_path_amount is not None else total_incoming_value
 
+    parent_pattern = getattr(parent_node, 'pattern_label', None)
+    relax_value_threshold = parent_pattern in ('FAN_OUT_LAYERING', 'SMURFING')
+    effective_min_value_share = 0.0 if relax_value_threshold else MIN_VALUE_SHARE_TO_FOLLOW
+
     for edge in sorted_edges:
         value_share = edge['amount'] / total_incoming_value
         child = HopNode(edge['to'], incoming_tx=edge)
         child.value_share = value_share
 
-        # --- Compute priority score regardless of follow/prune outcome ---
-        # (a pruned branch still gets a score, so it can be picked up later
-        # from the "monitor" queue if it becomes relevant)
         if transactions_df is not None:
             feats = build_address_features(edge['to'], transactions_df)
             pattern_result = run_pattern_detection(edge['to'], transactions_df)
@@ -100,11 +118,14 @@ def decide_branches(parent_node, outgoing_edges, total_incoming_value, budget_st
         child.priority_score = score_result['priority_score']
         child.priority_level, _ = priority_level(child.priority_score)
 
-        if value_share < MIN_VALUE_SHARE_TO_FOLLOW:
+        child_cumulative_amount = cumulative_path_amount * value_share
+        child.percent_of_original = round((child_cumulative_amount / original_stolen_amount) * 100, 2) if original_stolen_amount > 0 else None
+
+        if value_share < effective_min_value_share:
             child.status = 'pruned'
             child.reason = (f"Only {value_share:.1%} of parent value "
                              f"({edge['amount']} USDT) -- below "
-                             f"{MIN_VALUE_SHARE_TO_FOLLOW:.0%} threshold. "
+                             f"{effective_min_value_share:.0%} threshold. "
                              f"Priority score {child.priority_score} ({child.priority_level}) -- "
                              f"logged for monitoring, not actively traced now.")
             decisions.append(child)
@@ -126,8 +147,9 @@ def decide_branches(parent_node, outgoing_edges, total_incoming_value, budget_st
             continue
 
         child.status = 'followed'
-        child.reason = (f"Carries {value_share:.1%} of traced value "
-                         f"({edge['amount']} USDT) -- above threshold. "
+        reason_prefix = (f"Part of parent's {parent_pattern} pattern -- " if relax_value_threshold else "")
+        child.reason = (f"{reason_prefix}Carries {value_share:.1%} of traced value "
+                         f"({edge['amount']} USDT). "
                          f"Priority score {child.priority_score} ({child.priority_level}) -- "
                          f"actively traced forward.")
         budget_state['nodes_visited'] += 1
@@ -163,17 +185,30 @@ def trace_tree(address, incoming_tx, total_value, budget_state, depth=0, max_dep
     transactions_df = pd.DataFrame(all_rows)
 
     pattern_result = run_pattern_detection(address, transactions_df)
+    node.pattern_label = pattern_result['pattern_label']   # store regardless of outcome, for graph display
+
     if pattern_result['pattern_label'] == 'SUSPECTED_MIXER':
         node.status = 'dead_end'
         node.reason = "Mixer-like fan-in/fan-out pattern detected -- tracing boundary."
         return node
 
     deposit_score = run_deposit_heuristic(address, transactions_df)
-    if deposit_score > 0.6:
+    in_degree = transactions_df[transactions_df['to_address'] == address]['from_address'].nunique()
+
+    if deposit_score > 0.6 and in_degree >= MIN_INDEGREE_FOR_TERMINUS:
         node.status = 'terminus'
         node.confidence = deposit_score
-        node.reason = f"Matches deposit-address pattern (confidence {deposit_score:.2f})"
+        node.reason = (f"Matches deposit-address pattern (confidence {deposit_score:.2f}, "
+                        f"received from {in_degree} distinct senders)")
         return node
+    elif deposit_score > 0.6:
+        # Looks like a one-off match (single-outbound-target, amount/time
+        # aligned) but doesn't yet show the many-in fan-in pattern of a
+        # real exchange -- treat as a normal mule hop and keep tracing,
+        # rather than falsely stopping here.
+        node.reason_note = (f"Deposit-pattern score was {deposit_score:.2f} but only "
+                             f"{in_degree} distinct sender(s) seen so far -- "
+                             f"not yet enough to confirm an exchange; continuing trace.")
 
     outgoing_edges = [e for e in edges if e['from'] == address]
     if not outgoing_edges:
@@ -195,17 +230,79 @@ def trace_tree(address, incoming_tx, total_value, budget_state, depth=0, max_dep
                                 original_stolen_amount=original_stolen_amount)
         node.children.append(child)
 
+    # CRITICAL: this node continued tracing (wasn't dead_end/terminus/pruned
+    # above), so its own status must be explicitly 'followed'. Without this,
+    # the node's status stays None, which assign_style_role() doesn't
+    # recognize -- causing it to silently disappear from the graph even
+    # though it was legitimately traced.
+    node.status = 'followed'
+    if not node.reason:
+        node.reason = getattr(node, 'reason_note', None) or "Continued tracing forward through this hop."
+
     return node
 
 
-def run_full_trace(victim_address):
-    """Entry point: kick off a full multi-branch trace from a victim address."""
+def run_full_trace_from_tx_id(tx_hash):
+    """
+    Entry point (Option 2 -- more precise): start from a SPECIFIC
+    transaction hash instead of a suspect address. This reveals the
+    TRUE victim sender address (the transaction's 'from' field) as a
+    bonus, so the graph can show a real Victim node distinct from the
+    Suspect wallet that received the funds.
+
+    IMPORTANT FIX: the suspect node is built DIRECTLY via trace_tree()
+    -- exactly the same call pattern address-mode uses for its entry
+    address -- starting at depth=0 so it gets the FULL hop budget
+    going forward. An earlier version built two separate node objects
+    and copied fields between them starting at depth=1, which both
+    risked losing data in the copy and cut the trace one hop short.
+    """
+    from src.ingestion.fetch_transaction import fetch_transaction_by_id
+
+    tx = fetch_transaction_by_id(tx_hash)
+    if tx is None:
+        error_root = HopNode(tx_hash)
+        error_root.status = 'dead_end'
+        error_root.reason = "Could not fetch or decode this transaction. Check the hash and try again."
+        return error_root
+
     budget_state = {'nodes_visited': 0}
-    root = HopNode(victim_address)
+
+    # The TRUE victim -- the sender of this exact transaction
+    victim_node = HopNode(tx['from'])
+    victim_node.status = 'followed'
+    victim_node.forced_role = 'Victim'
+
+    exact_amount = tx['amount']
+
+    # Build the suspect node and its ENTIRE downstream trace in one
+    # call -- depth=0 so subsequent hops (bridge wallets, mixers,
+    # peel-chains, fan-out, smurfing, right up to the final exchange
+    # terminus or dead end) all get traced, exactly as address-mode does.
+    suspect_node = trace_tree(
+        tx['to'], tx, exact_amount, budget_state, depth=0,
+        cumulative_path_amount=exact_amount,
+        original_stolen_amount=exact_amount
+    )
+    suspect_node.forced_role = 'Suspect'
+
+    victim_node.children.append(suspect_node)
+    return victim_node
+
+
+def run_full_trace(suspect_address):
+    """
+    Entry point: kick off a full multi-branch trace from the
+    victim-reported SUSPECT wallet address. There is no separate
+    "victim address" anywhere in this system -- the victim reports a
+    suspect's wallet, and tracing starts from that single address.
+    """
+    budget_state = {'nodes_visited': 0}
+    root = HopNode(suspect_address)
     root.status = 'followed'
     root.children = []
 
-    first_edges = fetch_transfers(victim_address)
+    first_edges = fetch_transfers(suspect_address)
     if not first_edges:
         root.status = 'dead_end'
         root.reason = "No outgoing transactions found for this address."
@@ -216,6 +313,9 @@ def run_full_trace(victim_address):
                  'amount': e['amount'], 'timestamp': e['timestamp'], 'hash': e['hash']}
                 for e in first_edges]
     transactions_df = pd.DataFrame(all_rows)
+
+    root_pattern_result = run_pattern_detection(suspect_address, transactions_df)
+    root.pattern_label = root_pattern_result['pattern_label']
 
     children = decide_branches(root, first_edges, total_value, budget_state,
                                 cumulative_path_amount=total_value,
@@ -318,11 +418,19 @@ def get_priority_worklist(root_node):
 def assign_role(node, is_root=False):
     """
     Turn a HopNode's status + reason into a plain-English role label
-    (Victim / Mule / Mixer / Exchange), for use in tables and UI --
-    independent of which graph visualisation is being rendered.
+    (Suspect / Mule / Mixer / Exchange), for use in tables and UI.
+
+    If entry was via a transaction ID, node.forced_role will already be
+    set to the TRUE 'Victim' or 'Suspect' and takes priority. If entry
+    was via address alone, the root is labeled Suspect (there is no
+    separate "victim address" known in that mode).
     """
+    if getattr(node, 'forced_role', None):
+        label_map = {'Victim': 'Victim Wallet (true sender)', 'Suspect': 'Suspect Wallet'}
+        return label_map.get(node.forced_role, node.forced_role)
+
     if is_root:
-        return 'Victim Wallet'
+        return 'Suspect Wallet (entered address)'
     if node.status == 'terminus':
         return 'Exchange / Deposit Wallet'
     if node.status == 'dead_end':
@@ -344,8 +452,8 @@ def print_tree(node, indent=0):
 
 
 if __name__ == "__main__":
-    victim_address = "trinetra/src/ingestion/fetch_trongrid.py"
-    tree = run_full_trace(victim_address)
+    suspect_address = "TWXLTtvZKonEmYA2NNLSw5goGooeWT7Vj9"
+    tree = run_full_trace(suspect_address)
     print_tree(tree)
 
     print("\n--- Trace Summary ---")

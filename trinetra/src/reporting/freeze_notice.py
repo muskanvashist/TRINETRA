@@ -35,7 +35,7 @@ def build_hop_path_to_terminus(root_node, terminus_address):
     return path
 
 
-def generate_freeze_notice_pdf(candidate, victim_address, hop_path, case_id=None):
+def generate_freeze_notice_pdf(candidate, suspect_address, hop_path, case_id=None):
     """
     Generate one freeze/preservation notice PDF for a single exchange
     terminus. One PDF is created per terminus, since a fan-out trace
@@ -70,9 +70,9 @@ def generate_freeze_notice_pdf(candidate, victim_address, hop_path, case_id=None
     # --- Case summary ---
     elements.append(Paragraph("1. Case Summary", heading_style))
     elements.append(Paragraph(
-        f"This notice concerns funds originating from victim-reported wallet "
-        f"<b>{victim_address}</b>, traced forward on-chain to a deposit address "
-        f"associated with the platform identified below.", body_style
+        f"This notice concerns funds originating from the victim-reported "
+        f"suspect wallet <b>{suspect_address}</b>, traced forward on-chain to "
+        f"a deposit address associated with the platform identified below.", body_style
     ))
     elements.append(Spacer(1, 8))
 
@@ -159,7 +159,7 @@ def generate_all_freeze_notices(report, root_node):
     generated_files = []
     for candidate in report['freeze_notice_candidates']:
         hop_path = build_hop_path_to_terminus(root_node, candidate['address'])
-        filepath = generate_freeze_notice_pdf(candidate, report['victim_address'], hop_path)
+        filepath = generate_freeze_notice_pdf(candidate, report['suspect_address'], hop_path)
         generated_files.append(filepath)
 
     if not generated_files:
@@ -172,8 +172,8 @@ if __name__ == "__main__":
     from src.tracing.tree_trace import run_full_trace, summarise_trace_status
     from src.reporting.generate_report import generate_report
 
-    victim_address = "TWXLTtvZKonEmYA2NNLSw5goGooeWT7Vj9" # real address
-    tree = run_full_trace(victim_address)
-    report = generate_report(tree, victim_address, summarise_trace_status)
+    suspect_address = "TWXLTtvZKonEmYA2NNLSw5goGooeWT7Vj9"
+    tree = run_full_trace(suspect_address)
+    report = generate_report(tree, suspect_address, summarise_trace_status)
 
     generate_all_freeze_notices(report, tree)

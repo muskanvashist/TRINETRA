@@ -10,13 +10,17 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import streamlit.components.v1 as components
 
-from src.tracing.tree_trace import run_full_trace, summarise_trace_status, assign_role
-from src.tracing.visualise_graph import build_neon_graph_data, build_html
+from src.tracing.tree_trace import run_full_trace, run_full_trace_from_tx_id, summarise_trace_status, assign_role
+from src.tracing.plotly_fundflow import build_plotly_fundflow
 from src.heuristics.deposit_heuristic import run_deposit_heuristic
 from src.heuristics.pattern_detection import run_pattern_detection
 from src.features.feature_engineering import build_address_features
 from src.model.hybrid_classify import classify_address, get_heuristic_result
 from src.model.predict import predict_address_type, load_model
+from src.utils.cleanup import clear_live_trace_temp_data
+from src.reporting.generate_report import generate_report
+from src.reporting.freeze_notice import generate_all_freeze_notices
+import json
 
 st.set_page_config(page_title="Trinetra — Fund Intelligence", layout="wide", page_icon="🔍")
 
@@ -41,17 +45,29 @@ with col_logo:
     st.markdown("### 🛡️")
 with col_title:
     st.title("Trinetra — Fund Intelligence")
-    st.caption("Enter a scammer/victim wallet address to trace fund flow, detect laundering patterns, and get a risk score.")
+    st.caption("Enter the victim-reported SUSPECT wallet address to trace fund flow, detect laundering patterns, and get a risk score.")
 
 st.divider()
 
 # ---------------- Input form ----------------
 st.subheader("🔎 Start a Trace")
 
+entry_mode = st.radio(
+    "How do you want to start the trace?",
+    options=["Suspect wallet address", "Exact transaction ID (more precise)"],
+    horizontal=True,
+    help="A transaction ID pinpoints the exact payment being reported -- "
+         "no ambiguity about which of the suspect's many transactions is relevant, "
+         "and it also reveals the true victim sender address."
+)
+
 input_col1, input_col2, input_col3, input_col4 = st.columns([3, 2, 2, 1])
 
 with input_col1:
-    address_input = st.text_input("Scammer / Victim-reported wallet address", placeholder="TXYZ...")
+    if entry_mode == "Suspect wallet address":
+        address_input = st.text_input("Suspect wallet address (victim-reported)", placeholder="TXYZ...")
+    else:
+        address_input = st.text_input("Transaction hash / ID", placeholder="e.g. a1b2c3...")
 with input_col2:
     payment_datetime = st.datetime_input(
         "Victim payment date & time",
@@ -79,19 +95,50 @@ st.divider()
 
 
 # ---------------- Helper: risk score calculation ----------------
-def compute_risk_score(summary, flagged_count, deposit_score):
+def compute_risk_score(summary, flagged_count, deposit_score, tree=None, entered_address_pattern=None):
     """
-    Simple transparent risk scoring (0-100) combining:
-    - how much of the trace hit dead ends / mixers (bad)
-    - how many suspicious patterns were flagged
-    - how confidently a terminus was identified
+    Risk score (0-100) combining multiple independent signals so the
+    score actually varies meaningfully case to case, instead of
+    saturating quickly to a narrow band.
+
+    Previous version: base=40, capped bonuses that maxed out with as
+    few as 3 flagged addresses -- most real traces hit that cap
+    immediately, producing scores clustered in a narrow ~79-85 band
+    regardless of how different two cases actually were.
     """
-    base = 40
-    if summary['overall_status'] == 'PARTIALLY_RESOLVED':
-        base += 15
-    base += min(flagged_count * 10, 30)
-    base += int(deposit_score * 15)
-    return min(base, 100)
+    score = 20.0   # lower base so there's more room to differentiate upward
+
+    # 1. How much of the traced value reached a confirmed exchange?
+    # Counterintuitively, LOWER traceability can mean either a dead
+    # trail (less certain) or successful evasion -- we treat unresolved
+    # money as raising risk, since it suggests active evasion.
+    percent_traced = summary.get('percent_traced_to_exchange', 0) or 0
+    score += (100 - percent_traced) * 0.25
+
+    # 2. Overall resolution status
+    if summary.get('overall_status') == 'PARTIALLY_RESOLVED':
+        score += 10
+
+    # 3. Dead ends / mixers -- NOT capped as low as before, scales
+    # more gradually so 1 vs 5 dead ends actually looks different
+    dead_end_count = summary.get('dead_end_count', 0) or 0
+    score += min(dead_end_count * 6, 25)
+
+    # 4. Reaching a terminus is itself notable (an actual cash-out lead)
+    terminus_count = summary.get('terminus_count', 0) or 0
+    score += min(terminus_count * 4, 12)
+
+    # 5. The ENTERED address's own deposit-heuristic score
+    score += deposit_score * 12
+
+    # 6. If the entered address itself matches a specific laundering
+    # pattern (mixer/peel-chain/fan-out/smurfing), that's a strong
+    # standalone risk signal
+    high_risk_patterns = ('SUSPECTED_MIXER', 'PEEL_CHAIN', 'FAN_OUT_LAYERING', 'SMURFING')
+    if entered_address_pattern in high_risk_patterns:
+        score += 15
+
+    return round(min(max(score, 0), 100), 1)
 
 
 def risk_label(score):
@@ -129,23 +176,36 @@ def draw_risk_gauge(score):
 if any_action and address_input:
 
     with st.spinner("Fetching blockchain data and running trace..."):
-        tree = run_full_trace(address_input)
+        # Treat every new address as fresh -- wipe any leftover temp
+        # data from the previous trace before starting this one, so
+        # disk usage never accumulates and speed stays consistent.
+        clear_live_trace_temp_data()
+
+        if entry_mode == "Exact transaction ID (more precise)":
+            tree = run_full_trace_from_tx_id(address_input)
+        else:
+            tree = run_full_trace(address_input)
+
         summary = summarise_trace_status(tree)
 
-        # Build a transactions_df from the tree for heuristic scoring
+        # Build a PROPERLY connected transactions_df from the tree --
+        # each edge needs the real parent (from_address), not None.
+        # The earlier version hardcoded from_address=None, which meant
+        # every address's out_degree was always 0, breaking the
+        # deposit heuristic and ML features for every single address.
         all_rows = []
-        def collect_rows(node):
-            if node.incoming_tx:
+        def collect_rows(node, parent_address=None):
+            if node.incoming_tx and parent_address is not None:
                 all_rows.append({
-                    'from_address': None,
+                    'from_address': parent_address,
                     'to_address': node.address,
                     'amount': node.incoming_tx['amount'],
                     'timestamp': node.incoming_tx['timestamp'],
                     'hash': node.incoming_tx['hash']
                 })
             for c in node.children:
-                collect_rows(c)
-        collect_rows(tree)
+                collect_rows(c, parent_address=node.address)
+        collect_rows(tree, parent_address=None)
         transactions_df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame(
             columns=['from_address', 'to_address', 'amount', 'timestamp', 'hash'])
 
@@ -163,7 +223,8 @@ if any_action and address_input:
                 collect_flagged(c, is_root=False)
         collect_flagged(tree, is_root=True)
 
-        risk_score = compute_risk_score(summary, len(flagged), deposit_score)
+        risk_score = compute_risk_score(summary, len(flagged), deposit_score,
+                                         entered_address_pattern=pattern_result.get('pattern_label'))
         label, badge_class, color = risk_label(risk_score)
 
     # ---------------- Top summary row ----------------
@@ -195,9 +256,21 @@ if any_action and address_input:
 
     with graph_col:
         st.subheader("🕸️ Fund Flow Graph")
-        neon_nodes, neon_edges = build_neon_graph_data(tree)
-        neon_html = build_html(neon_nodes, neon_edges)
-        components.html(neon_html, height=700)
+        fig, convergence_points = build_plotly_fundflow(tree)
+        if fig:
+            st.plotly_chart(
+                fig, use_container_width=True,
+                config={'scrollZoom': True, 'displaylogo': False,
+                        'modeBarButtonsToAdd': ['resetScale2d']}
+            )
+        else:
+            st.info("No addresses to display -- this address may have no outgoing transactions.")
+
+        if convergence_points:
+            st.markdown("**⭐ Convergence Points Detected**")
+            st.caption("These addresses receive funds from more than one separate branch -- "
+                       "suggesting multiple mule chains lead back to one operation.")
+            st.dataframe(pd.DataFrame(convergence_points), use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -263,6 +336,7 @@ if any_action and address_input:
             'Address': node.address,
             'Amount (USDT)': f"{node.incoming_tx['amount']:.2f}" if node.incoming_tx else "—",
             'Value Share of Parent': f"{node.value_share:.1%}" if node.value_share is not None else "—",
+            '% of Original Amount': f"{node.percent_of_original}%" if getattr(node, 'percent_of_original', None) is not None else "—",
             'Decision': node.status,
             'Reason': node.reason if node.reason else "Starting point of the trace."
         })
@@ -351,6 +425,54 @@ if any_action and address_input:
             st.info("No trained ML model found yet. Run `python -m src.model.train` first to enable this section.")
         except Exception as e:
             st.warning(f"Could not compute ML prediction for this address: {e}")
+
+    st.divider()
+
+    # ---------------- Report & Freeze Notice generation ----------------
+    st.subheader("📄 Generate Case Report & Freeze Notice")
+    st.caption("Generates a structured evidence report and, for every high-confidence "
+               "exchange terminus found, a ready-to-send PDF freeze/preservation notice.")
+
+    report_col1, report_col2 = st.columns(2)
+
+    with report_col1:
+        if st.button("📋 Generate Evidence Report (JSON)", use_container_width=True):
+            with st.spinner("Building structured report..."):
+                report = generate_report(tree, address_input, summarise_trace_status)
+                report_json = json.dumps(report, indent=2, default=str)
+
+            st.success(f"Report generated -- {len(report['freeze_notice_candidates'])} "
+                       f"high-confidence terminus candidate(s) found.")
+            st.download_button(
+                "⬇️ Download Evidence Report (JSON)",
+                report_json,
+                file_name=f"trinetra_report_{address_input[:10]}.json",
+                use_container_width=True
+            )
+            with st.expander("Preview report"):
+                st.json(report)
+
+    with report_col2:
+        if st.button("🧊 Generate Freeze Notice PDF(s)", use_container_width=True):
+            with st.spinner("Generating freeze notice PDF(s)..."):
+                report = generate_report(tree, address_input, summarise_trace_status)
+                generated_files = generate_all_freeze_notices(report, tree)
+
+            if generated_files:
+                st.success(f"Generated {len(generated_files)} freeze notice PDF(s).")
+                for filepath in generated_files:
+                    with open(filepath, 'rb') as f:
+                        st.download_button(
+                            f"⬇️ Download {os.path.basename(filepath)}",
+                            f.read(),
+                            file_name=os.path.basename(filepath),
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key=filepath
+                        )
+            else:
+                st.info("No high-confidence exchange terminus was found in this trace, "
+                        "so no freeze notice was generated.")
 
 elif any_action and not address_input:
     st.warning("Please enter a wallet address first.")

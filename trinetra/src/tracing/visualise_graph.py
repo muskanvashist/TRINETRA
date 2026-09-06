@@ -20,25 +20,56 @@ import webbrowser
 
 
 ROLE_STYLE = {
-    'Victim':   {'color': '#2ecc71', 'label': 'VICTIM'},
-    'Suspect':  {'color': '#e74c3c', 'label': 'SUSPECT'},
-    'Relay':    {'color': '#00d9ff', 'label': 'RELAY'},
-    'Exchange': {'color': '#f39c12', 'label': 'EXCHANGE'},
-    'Mixer':    {'color': '#9b59b6', 'label': 'MIXER'},
+    'Victim':      {'color': '#2ecc71', 'label': 'VICTIM (true sender)'},
+    'Suspect':     {'color': '#e74c3c', 'label': 'SUSPECT'},
+    'Relay':       {'color': '#00d9ff', 'label': 'RELAY'},
+    'Bridge':      {'color': '#1abc9c', 'label': 'BRIDGE (last hop before cash-out)'},
+    'Exchange':    {'color': '#f39c12', 'label': 'EXCHANGE'},
+    'Mixer':       {'color': '#9b59b6', 'label': 'MIXER'},
+    'Fan-Out':     {'color': '#e67e22', 'label': 'FAN-OUT'},
+    'Peel Chain':  {'color': '#ff6b9d', 'label': 'PEEL-CHAIN'},
+    'Smurfing':    {'color': '#8e44ad', 'label': 'SMURFING'},
+    'Dead End':    {'color': '#7f8c8d', 'label': 'DEAD END'},
+    'Monitored':   {'color': '#4a5568', 'label': 'MONITORED (low priority)'},
 }
 
 
 def assign_style_role(node, depth, is_root=False):
-    """Maps a HopNode to the design's role naming."""
+    """
+    Maps a HopNode to the design's role naming.
+
+    Every branch the tracer ever touched is shown -- including
+    low-priority/pruned branches, now labeled 'Monitored' instead of
+    being hidden entirely. Nothing that was part of the trace tree
+    silently disappears from the graph anymore.
+    """
+    forced = getattr(node, 'forced_role', None)
+    if forced:
+        return forced
+
     if is_root:
-        return 'Victim'
+        return 'Suspect'
     if node.status == 'terminus':
         return 'Exchange'
-    if node.status == 'dead_end' and node.reason and 'mixer' in node.reason.lower():
+
+    pattern = getattr(node, 'pattern_label', None)
+    if pattern == 'SUSPECTED_MIXER':
         return 'Mixer'
-    if node.status in ('followed', 'dead_end'):
-        return 'Suspect' if depth == 1 else 'Relay'
-    return None   # pruned -- excluded from this view
+    if pattern == 'FAN_OUT_LAYERING':
+        return 'Fan-Out'
+    if pattern == 'PEEL_CHAIN':
+        return 'Peel Chain'
+    if pattern == 'SMURFING':
+        return 'Smurfing'
+
+    if node.status == 'dead_end':
+        return 'Dead End'
+    if node.status == 'followed':
+        has_terminus_child = any(c.status == 'terminus' for c in node.children)
+        return 'Bridge' if has_terminus_child else 'Relay'
+    if node.status == 'pruned':
+        return 'Monitored'   # shown now, not hidden -- low priority, still visible
+    return None
 
 
 def compute_average_chain_delay(root_node):
@@ -130,8 +161,12 @@ def build_html(nodes, edges, avg_delay=None):
     nodes_json = json.dumps(nodes)
     edges_json = json.dumps(edges)
 
+    def safe_class_name(role):
+        return role.lower().replace(' ', '-').replace('_', '-')
+
     legend_items = "".join(
-        f'<span class="legend-item"><span class="dot dot-{role.lower()}"></span>{s["label"]}</span>'
+        f'<span class="legend-item"><span class="dot" style="background:{s["color"]};'
+        f'box-shadow:0 0 8px {s["color"]};"></span>{s["label"]}</span>'
         for role, s in ROLE_STYLE.items()
     )
 
@@ -166,11 +201,6 @@ def build_html(nodes, edges, avg_delay=None):
     .dot {{
       width: 12px; height: 12px; border-radius: 50%; display: inline-block;
     }}
-    .dot-victim {{ background: #2ecc71; box-shadow: 0 0 8px #2ecc71; }}
-    .dot-suspect {{ background: #e74c3c; box-shadow: 0 0 8px #e74c3c; }}
-    .dot-relay {{ background: #00d9ff; box-shadow: 0 0 8px #00d9ff; }}
-    .dot-exchange {{ background: #f39c12; box-shadow: 0 0 8px #f39c12; }}
-    .dot-mixer {{ background: #9b59b6; box-shadow: 0 0 8px #9b59b6; }}
     #header {{
       padding: 14px 24px;
       font-size: 14px; letter-spacing: 1px; color: #00d9ff;
@@ -388,6 +418,6 @@ def save_neon_graph(root_node, output_path="data/processed/neon_fundflow.html", 
 if __name__ == "__main__":
     from src.tracing.tree_trace import run_full_trace
 
-    victim_address = "PASTE_ADDRESS_HERE"
-    tree = run_full_trace(victim_address)
+    suspect_address = "TWXLTtvZKonEmYA2NNLSw5goGooeWT7Vj9"
+    tree = run_full_trace(suspect_address)
     save_neon_graph(tree)

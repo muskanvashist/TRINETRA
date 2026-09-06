@@ -10,18 +10,24 @@ from src.model.predict import predict_address_type, load_model
 def get_heuristic_result(address, transactions_df):
     """
     Package your existing heuristic outputs into the same
-    {'label': ..., 'confidence': ...} shape as the ML result,
-    so both can be compared directly in hybrid_classify().
+    {'label': ..., 'confidence': ...} shape as the ML result.
+
+    IMPORTANT: these thresholds now match tree_trace.py's actual
+    classification thresholds exactly (deposit_score > 0.6 for
+    terminus, pattern_label directly from run_pattern_detection).
+    Earlier this used stricter thresholds (0.8/0.7) than the graph
+    used, so the same address could show as "Mixer" in the graph but
+    "likely_mule_or_normal" here -- that mismatch is now fixed.
     """
     deposit_score = run_deposit_heuristic(address, transactions_df)
     pattern_result = run_pattern_detection(address, transactions_df)
 
-    if deposit_score > 0.8:
+    if deposit_score > 0.6:
         label = 'likely_deposit_address'
         confidence = deposit_score
-    elif pattern_result['mixer_pattern_score'] > 0.7:
-        label = 'likely_mixer'
-        confidence = pattern_result['mixer_pattern_score']
+    elif pattern_result['pattern_label'] not in (None, 'NORMAL_MULE', 'NORMAL'):
+        label = f"likely_{pattern_result['pattern_label'].lower()}"
+        confidence = pattern_result.get('mixer_pattern_score', 0.6) or 0.6
     else:
         label = 'likely_mule_or_normal'
         confidence = 0.5
